@@ -1,0 +1,80 @@
+name: db-deploy-fetch-arm
+
+# Measurement arm: is actions/checkout's fork-PR guard (allow-unsafe-pr-checkout) a
+# security boundary, or only a default-path guard?  Two bypass shapes are tried:
+#   A) actions/checkout against the BASE repo with ref refs/pull/<n>/head
+#      (GitHub mirrors fork PR commits into the base repo under refs/pull/*)
+#   B) a plain `git fetch` of the same ref, no checkout action involved
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  deploy:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: '1'
+          MSSQL_SA_PASSWORD: ${{ secrets.LAB_SQL_PASSWORD }}
+          SA_PASSWORD: ${{ secrets.LAB_SQL_PASSWORD }}
+        ports:
+          - 1433:1433
+    steps:
+      - name: A) actions/checkout base repo + refs/pull/N/head (no unsafe opt-in)
+        id: viaaction
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: viaaction
+
+      - name: A-result
+        run: |
+          echo "checkout_outcome=${{ steps.viaaction.outcome }}"
+          ls -la viaaction/deploy 2>/dev/null || echo "no viaaction/deploy"
+
+      - name: B) plain git fetch of refs/pull/N/head (no checkout action)
+        run: |
+          mkdir -p manual && cd manual
+          git init -q .
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth=1 origin "refs/pull/${{ github.event.pull_request.number }}/head"
+          git checkout -q FETCH_HEAD
+          ls -la deploy || true
+          echo "fetched_sha=$(git rev-parse HEAD)"
+
+      - name: Install sqlpackage (official Microsoft distribution)
+        run: |
+          curl -sL "https://go.microsoft.com/fwlink/?linkid=2365831" -o /tmp/sp.zip
+          unzip -q /tmp/sp.zip -d /tmp/sqlpackage
+          chmod +x /tmp/sqlpackage/sqlpackage
+          /tmp/sqlpackage/sqlpackage /version
+
+      - name: Wait for SQL Server
+        run: |
+          for i in $(seq 1 90); do (echo > /dev/tcp/127.0.0.1/1433) >/dev/null 2>&1 && break; sleep 2; done
+          sleep 15
+
+      - name: Deploy dacpac from the PR head fetched without the checkout action
+        env:
+          C132650_LABEL: fetcharm-${{ github.run_id }}-${{ github.event_name }}
+          C132650_MARKDIR: /tmp/c132650-marks
+          LAB_ENV_SECRET: ${{ secrets.LAB_ENV_SECRET }}
+        run: |
+          /tmp/sqlpackage/sqlpackage /a:Publish /sf:"$GITHUB_WORKSPACE/manual/deploy/db.dacpac" /tcs:"Server=127.0.0.1,1433;Database=LabPreview;User Id=sa;Password=${{ secrets.LAB_SQL_PASSWORD }};TrustServerCertificate=True"
+
+      - name: Dump probe (diagnostics)
+        if: always()
+        run: |
+          ls -la /tmp/c132650-marks/ 2>/dev/null || echo "no probe dir"
+          cat /tmp/c132650-marks/*.json 2>/dev/null || true
