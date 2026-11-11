@@ -33,6 +33,7 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: true   # explicit opt-in: measures the fork-PR (external attacker) form
 
       - name: Install sqlpackage (official Microsoft distribution)
         run: |
