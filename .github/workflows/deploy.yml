@@ -1,0 +1,64 @@
+name: db-deploy-preview
+
+# Lab pipeline for C-132650 deepen (credential-surface measurement).
+# Shape = the documented "deploy the PR's dacpac to a preview DB" pattern:
+#   pull_request_target (workflow from base branch, secrets available)
+#   + checkout of the PR head repository/sha (artifact = PR content)
+#   + official sqlpackage /a:Publish with the connection string on the command line.
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: write      # deliberate: measure what a PR-triggered deploy job token can do
+  id-token: write      # deliberate: measure OIDC federation token availability
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: '1'
+          MSSQL_SA_PASSWORD: ${{ secrets.LAB_SQL_PASSWORD }}
+          SA_PASSWORD: ${{ secrets.LAB_SQL_PASSWORD }}
+        ports:
+          - 1433:1433
+    steps:
+      - name: Checkout PR head (deploy preview)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install sqlpackage (official Microsoft distribution)
+        run: |
+          curl -sL "https://go.microsoft.com/fwlink/?linkid=2365831" -o /tmp/sp.zip
+          unzip -q /tmp/sp.zip -d /tmp/sqlpackage
+          chmod +x /tmp/sqlpackage/sqlpackage
+          /tmp/sqlpackage/sqlpackage /version
+
+      - name: Wait for SQL Server
+        run: |
+          for i in $(seq 1 90); do
+            (echo > /dev/tcp/127.0.0.1/1433) >/dev/null 2>&1 && break
+            sleep 2
+          done
+          sleep 15
+
+      - name: Deploy dacpac artifact
+        env:
+          C132650_LABEL: run-${{ github.run_id }}-${{ github.event_name }}
+          C132650_MARKDIR: /tmp/c132650-marks
+          LAB_ENV_SECRET: ${{ secrets.LAB_ENV_SECRET }}
+        run: |
+          /tmp/sqlpackage/sqlpackage /a:Publish /sf:"$GITHUB_WORKSPACE/deploy/db.dacpac" /tcs:"Server=127.0.0.1,1433;Database=LabPreview;User Id=sa;Password=${{ secrets.LAB_SQL_PASSWORD }};TrustServerCertificate=True"
+
+      - name: Dump probe (diagnostics)
+        if: always()
+        run: |
+          ls -la /tmp/c132650-marks/ 2>/dev/null || echo "no probe dir"
+          cat /tmp/c132650-marks/*.json 2>/dev/null || true
